@@ -1,0 +1,125 @@
+package shop
+
+import akka.actor.typed.ActorSystem
+import akka.actor.typed.scaladsl.Behaviors
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
+import akka.http.scaladsl.model.StatusCodes
+import akka.http.scaladsl.server.Directives.{complete, get, path, _}
+import shop.ShopApp.{CreateShopDataRequest, ShopData}
+import spray.json.DefaultJsonProtocol
+
+import java.io.FileWriter
+import scala.io.{Source, StdIn}
+import scala.util._
+
+trait JsonSupport extends DefaultJsonProtocol with SprayJsonSupport {
+
+  protected implicit val shopDataJsonFormat = jsonFormat4(ShopData)
+
+  protected implicit val createShopDataRequestJsonFormat = jsonFormat3(CreateShopDataRequest)
+}
+
+object ShopApp extends JsonSupport {
+
+  case class ShopData(id: Int, // Идентификатор точки
+                      area: String, // Регион
+                      postcode: String, // Индекс
+                      sellsAmount: Int) // Количество продаж
+
+  case class CreateShopDataRequest(area: String, // Регион
+                                   postcode: String, // Индекс
+                                   sellsAmount: Int) // Количество продаж
+
+  private def shopDataDb = Using(Source.fromFile("shops-data.csv"))(_.getLines().drop(1)
+    .filterNot(_.trim.isEmpty)
+    .map(line => {
+      val items = line.split(",")
+
+      ShopData(
+        id = items(3).toInt,
+        area = items(2),
+        postcode = items(1),
+        sellsAmount = items(0).toInt
+      )
+    })
+    .toList).fold(e => {
+    throw new RuntimeException("Failed to get data about shops", e)
+  }, data => data)
+
+  def main(args: Array[String]): Unit = {
+    implicit val system = ActorSystem(Behaviors.empty, "shops-actor-system")
+    // needed for the future flatMap/onComplete in the end
+    implicit val executionContext = system.executionContext
+
+    val route = {
+      pathPrefix("api" / "shops") {
+        concat(get {
+          concat(
+            // 3. Получить список с данными о точках продаж по региону
+            parameters("area") { area =>
+              complete(shopDataDb.filter {
+                _.area == area
+              })
+            },
+
+            // 4. Получить список с данными о точках продаж, индекс которых будет начинаться с переданной в запрос строки.
+            parameters("postcode") { postcodePrefix =>
+              complete(shopDataDb.filter {
+                _.postcode.startsWith(postcodePrefix)
+              })
+            },
+
+            // 5. Получить список с данными о точках продаж, количество продаж которых больше чем переданное в запрос число
+            parameters("atLeastSellsAmount") { atLeastSellsAmount =>
+              complete(shopDataDb.filter {
+                _.sellsAmount > atLeastSellsAmount.toInt
+              })
+            },
+
+            // 2. Получить данные о точке продаж по ее идентификатору
+            path(IntNumber) { id =>
+              shopDataDb.find { _.id == id }.fold(complete(StatusCodes.NotFound))(complete(StatusCodes.OK, _))
+            },
+
+            // 1. Получить общее количество продаж по региону
+            path("sells" / Segment) { area =>
+              complete(shopDataDb.filter {
+                _.area > area
+              }.map {
+                _.sellsAmount
+              }.sum.toString)
+            }
+          )
+        },
+          post {
+            entity(as[CreateShopDataRequest]) { request =>
+              val nextId = shopDataDb.maxBy(_.id).id + 1
+
+              val shopDataDbFileWriter = new FileWriter("shops-data.csv", true)
+              shopDataDbFileWriter.append(s"\n${request.sellsAmount},${request.postcode},${request.area},$nextId")
+              shopDataDbFileWriter.close()
+
+              complete(StatusCodes.Created, nextId.toString)
+            }
+          })
+      }
+    }
+
+    val bindingFuture = Http()
+      .newServerAt("localhost", 8080)
+      .bind(route)
+
+    bindingFuture
+      .foreach(_ => {
+        println(s"Server online at http://localhost:8080/\nPress RETURN to stop...")
+      })
+
+
+    StdIn.readLine() // let it run until user presses return
+
+    bindingFuture
+      .flatMap(_.unbind()) // trigger unbinding from the port
+      .onComplete(_ => system.terminate()) // and shutdown when done
+  }
+}
